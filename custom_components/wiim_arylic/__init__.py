@@ -37,6 +37,30 @@ except ModuleNotFoundError:  # pragma: no cover – only executed in test env
 
     importlib.import_module("homeassistant")
 
+# ---------------------------------------------------------------------------
+# Arylic pywiim patch — shadow 4 pywiim modules with local patched versions.
+# This must run before any pywiim import so the patched modules are in
+# sys.modules when pywiim itself does its internal imports.
+# ---------------------------------------------------------------------------
+import importlib as _importlib
+
+_PATCHES = {
+    "pywiim.profiles":        "custom_components.wiim_arylic.pywiim_local.profiles",
+    "pywiim.api.playback":    "custom_components.wiim_arylic.pywiim_local.api.playback",
+    "pywiim.player.coverart": "custom_components.wiim_arylic.pywiim_local.player.coverart",
+    "pywiim.upnp.client":     "custom_components.wiim_arylic.pywiim_local.upnp.client",
+}
+for _target, _source in _PATCHES.items():
+    if _target not in sys.modules:
+        try:
+            sys.modules[_target] = _importlib.import_module(_source)
+        except Exception as _patch_err:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Arylic patch failed for %s: %s", _target, _patch_err
+            )
+# ---------------------------------------------------------------------------
+
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -441,7 +465,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         capabilities=capabilities,
         port=port,
         protocol=protocol,
-        # timeout=entry.data.get("timeout", 10),
+        timeout=entry.data.get("timeout", 10),
     )
 
     # Store coordinator and entry directly in hass.data
