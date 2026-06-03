@@ -50,31 +50,20 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.hass = hass
         self.entry = entry
+        self._host = host  # Save explicit host IP string for internal HA use
         self._capabilities = capabilities or {}
 
         # Get HA's shared aiohttp session (for connection pooling)
         session = async_get_clientsession(hass)
 
-        # Create pywiim client with HA's session
-        # Only pass port/protocol if we have a cached endpoint (optimized pattern)
-        # Otherwise, let pywiim probe automatically (simplest pattern)
-        client_kwargs = {
-            "host": host,
-            "timeout": timeout,
-            "session": session,
-            "capabilities": capabilities,
-        }
-        if port is not None and protocol is not None:
-            # We have a cached endpoint - use it for faster startup
-            client_kwargs["port"] = port
-            client_kwargs["protocol"] = protocol
-        # If port/protocol not provided, pywiim will probe automatically
+        # Map out the correct port number, defaulting to standard UPnP 49152
+        port_num = port or 49152
 
-        
-        client_kwargs.pop("capabilities", None)
-        client_kwargs.pop("timeout", None)
-        client_kwargs.pop("port", None)
-        client_kwargs.pop("protocol", None)
+        # Build clean kwargs using the mandatory description_url rule for modern pywiim
+        client_kwargs = {
+            "description_url": f"http://{host}:{port_num}/description.xml",
+            "session": session,
+        }
         
         client = WiiMClient(**client_kwargs)
 
@@ -126,7 +115,9 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             try:
                 p = coordinator.player
-                if getattr(p, "host", None) == host_or_uuid:
+                # Modern pywiim check via internal client description or coordinator property fallback
+                p_host = getattr(p, "host", None) or getattr(coordinator, "_host", None)
+                if p_host == host_or_uuid:
                     return p
                 if getattr(p, "uuid", None) == host_or_uuid:
                     return p
@@ -184,12 +175,6 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._refresh_in_progress = False
 
             # ARYLIC PATCH: Proactively initialize UPnP client for Arylic devices.
-            # pywiim creates the UPnP client lazily, only when queue ops are
-            # requested. Arylic devices never trigger that path during normal
-            # playback, so _upnp_client stays None and our artwork/command
-            # patches silently fall back to broken behavior.
-            # We call _ensure_upnp_client() once after first refresh so the
-            # UPnP client is ready before any track change fires.
             if self.player._upnp_client is None:
                 profile = getattr(self.player, "_profile", None)
                 vendor = getattr(profile, "vendor", "") if profile else ""
@@ -198,13 +183,13 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         await self.player._ensure_upnp_client()
                         _LOGGER.debug(
                             "Arylic UPnP client initialized for %s: available=%s",
-                            self.player.host,
+                            self._host,
                             self.player._upnp_client is not None,
                         )
                     except Exception as _upnp_err:
                         _LOGGER.debug(
                             "Arylic UPnP client init failed for %s (will retry): %s",
-                            self.player.host,
+                            self._host,
                             _upnp_err,
                         )
 
@@ -220,11 +205,12 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if is_playing and _LOGGER.isEnabledFor(logging.DEBUG):
                 _LOGGER.debug(
                     "Poll result for %s: state=%s, pos=%s, dur=%s, title='%s'",
-                    self.player.host,
+                    self._host,
                     self.player.play_state,
                     self.player.media_position,
                     self.player.media_duration,
                     self.player.media_title,
+                    self.player.media_version if hasattr(self.player, 'media_version') else '',
                 )
 
             result = {"player": self.player}
@@ -232,10 +218,10 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         except WiiMError as err:
             if _is_expected_unreachable_error(err):
-                _LOGGER.debug("Update failed for %s: %s", self.player.host, _compact_wiim_error(err))
+                _LOGGER.debug("Update failed for %s: %s", self._host, _compact_wiim_error(err))
             else:
-                _LOGGER.warning("Update failed for %s: %s", self.player.host, _compact_wiim_error(err))
+                _LOGGER.warning("Update failed for %s: %s", self._host, _compact_wiim_error(err))
             # Return cached Player object even on error
             if self.data:
                 return self.data
-            raise UpdateFailed(f"Failed to communicate with {self.player.host}: {_compact_wiim_error(err)}") from err
+            raise UpdateFailed(f"Failed to communicate with {self._host}: {_compact_wiim_error(err)}") from err
