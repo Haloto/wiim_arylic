@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -11,6 +12,8 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from pywiim import Player, PollingStrategy, WiiMClient
 from pywiim.exceptions import WiiMError
+
+from .upnp_getinfoex import UpnpGetInfoExPoller
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +94,12 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Use pywiim's PollingStrategy to determine when to poll
         self._polling_strategy = PollingStrategy(self._capabilities) if self._capabilities else PollingStrategy({})
         self._refresh_in_progress = False
+
+        # UPnP GetInfoEx poller for cover art (not available via HTTP API).
+        # Uses HA's shared session - same one passed to WiiMClient above.
+        self._upnp_poller = UpnpGetInfoExPoller(host=host, session=session)
+        # Track last injected image_url to avoid redundant state pushes.
+        self._last_upnp_image_url: str | None = None
 
     def update_capabilities(self, capabilities: dict[str, Any]) -> None:
         """Apply a refreshed capabilities mapping (e.g. after firmware change).
@@ -177,30 +186,14 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             finally:
                 self._refresh_in_progress = False
 
-            # ARYLIC PATCH: Proactively initialize UPnP client for Arylic devices.
-            # pywiim creates the UPnP client lazily, only when queue ops are
-            # requested. Arylic devices never trigger that path during normal
-            # playback, so _upnp_client stays None and our artwork/command
-            # patches silently fall back to broken behavior.
-            # We call _ensure_upnp_client() once after first refresh so the
-            # UPnP client is ready before any track change fires.
-            if self.player._upnp_client is None:
-                profile = getattr(self.player, "_profile", None)
-                vendor = getattr(profile, "vendor", "") if profile else ""
-                if vendor == "arylic":
-                    try:
-                        await self.player._ensure_upnp_client()
-                        _LOGGER.debug(
-                            "Arylic UPnP client initialized for %s: available=%s",
-                            self.player.host,
-                            self.player._upnp_client is not None,
-                        )
-                    except Exception as _upnp_err:
-                        _LOGGER.debug(
-                            "Arylic UPnP client init failed for %s (will retry): %s",
-                            self.player.host,
-                            _upnp_err,
-                        )
+            # --- UPnP GetInfoEx cover art poll (supplemental, best-effort) ---
+            # The HTTP API does not expose albumArtURI. We poll the Linkplay
+            # UPnP AVTransport endpoint (port 59152) ourselves and inject the
+            # result into pywiim's state machine via update_from_upnp().
+            # We do NOT use pywiim's built-in UPnP eventer because it requires
+            # a push subscription that reliably times out on these devices.
+            await self._poll_upnp_cover_art()
+            # ------------------------------------------------------------------
 
             # Update polling interval using pywiim's PollingStrategy
             role = self.player.role
@@ -233,3 +226,78 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.data:
                 return self.data
             raise UpdateFailed(f"Failed to communicate with {self.player.host}: {_compact_wiim_error(err)}") from err
+
+    async def _poll_upnp_cover_art(self) -> None:
+        """Poll UPnP GetInfoEx and inject cover art URL into pywiim's state.
+
+        This is a best-effort supplemental call. Any exception is swallowed so
+        it never disrupts the main coordinator update cycle.
+
+        Injection strategy
+        ------------------
+        We call ``player._state_synchronizer.update_from_upnp()`` with an
+        ``image_url`` key. The state machine gives UPnP source priority over
+        HTTP for ``image_url`` (see pywiim/state.py SOURCE_PRIORITY), so the
+        art URL we inject will be picked up by ``player.media_image_url`` and
+        subsequently by ``async_get_media_image()`` in the entity.
+
+        We also update ``player._status_model.entity_picture`` / ``cover_url``
+        directly as a belt-and-braces fallback, mirroring what pywiim's own
+        ``_fetch_artwork_from_metainfo`` does.
+
+        We only push an update when the image_url actually changes to avoid
+        unnecessary state churn.
+        """
+        try:
+            upnp_data = await self._upnp_poller.poll()
+            if not upnp_data:
+                return
+
+            image_url: str | None = upnp_data.get("image_url")
+
+            # Nothing to inject
+            if not image_url:
+                return
+
+            # Skip if unchanged
+            if image_url == self._last_upnp_image_url:
+                return
+
+            self._last_upnp_image_url = image_url
+
+            _LOGGER.debug(
+                "UPnP GetInfoEx: injecting cover art for %s: %s",
+                self.player.host,
+                image_url,
+            )
+
+            # --- Inject into pywiim state machine ---
+            # update_from_upnp() accepts the same field names as update_from_http()
+            # including "image_url". It merges the value with correct source priority.
+            state_sync = getattr(self.player, "_state_synchronizer", None)
+            if state_sync is not None and hasattr(state_sync, "update_from_upnp"):
+                state_sync.update_from_upnp(
+                    {"image_url": image_url},
+                    timestamp=time.time(),
+                )
+
+            # Belt-and-braces: also stamp the cached status model so
+            # PlayerProperties.media_image_url sees the new URL immediately
+            # (before the next full merge cycle).
+            status_model = getattr(self.player, "_status_model", None)
+            if status_model is not None:
+                # entity_picture and cover_url are the two fields checked by
+                # PlayerProperties._status_field("image_url", "entity_picture", "cover_url")
+                for attr in ("entity_picture", "cover_url"):
+                    try:
+                        setattr(status_model, attr, image_url)
+                    except (AttributeError, TypeError):
+                        pass  # read-only or non-existent on this pywiim version
+
+        except Exception as err:  # noqa: BLE001
+            # Never let cover art polling break the main update
+            _LOGGER.debug(
+                "UPnP cover art poll failed for %s (non-fatal): %s",
+                self.player.host,
+                err,
+            )
