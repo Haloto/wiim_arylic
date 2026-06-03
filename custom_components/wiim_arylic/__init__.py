@@ -43,7 +43,9 @@ except ModuleNotFoundError:  # pragma: no cover – only executed in test env
 # sys.modules when pywiim itself does its internal imports.
 # ---------------------------------------------------------------------------
 import importlib.util as _ilu
+import sys
 from pathlib import Path as _Path
+import types
 
 _PYWIIM_LOCAL = _Path(__file__).parent / "pywiim_local"
 
@@ -54,20 +56,28 @@ _PATCHES = [
     ("pywiim.upnp.client",     _PYWIIM_LOCAL / "upnp" / "client.py",     "pywiim.upnp"),
 ]
 
+# CRITICAL FIX: Ensure parent packages exist in sys.modules first so relative imports don't explode
+for parent in ["pywiim", "pywiim.api", "pywiim.player", "pywiim.upnp"]:
+    if parent not in sys.modules:
+        sys.modules[parent] = types.ModuleType(parent)
+
 for _target, _path, _package in _PATCHES:
-    if _target not in sys.modules:
-        try:
-            _spec = _ilu.spec_from_file_location(_target, _path)
+    if _target in sys.modules and type(sys.modules[_target]) is not types.ModuleType:
+        continue  # Already patched or loaded safely
+        
+    try:
+        _spec = _ilu.spec_from_file_location(_target, _path)
+        if _spec and _spec.loader:
             _mod = _ilu.module_from_spec(_spec)
             _mod.__package__ = _package
             sys.modules[_target] = _mod
             _spec.loader.exec_module(_mod)
-        except Exception as _patch_err:  # noqa: BLE001
-            sys.modules.pop(_target, None)  # roll back so original wiim isn't poisoned
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "Arylic patch failed for %s: %s", _target, _patch_err
-            )
+    except Exception as _patch_err:  # noqa: BLE001
+        sys.modules.pop(_target, None)  # roll back so original wiim isn't poisoned
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Arylic patch failed for %s: %s", _target, _patch_err
+        )
 # ---------------------------------------------------------------------------
 import logging
 from typing import Any
