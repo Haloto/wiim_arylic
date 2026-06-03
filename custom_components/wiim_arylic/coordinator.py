@@ -70,6 +70,7 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             client_kwargs["protocol"] = protocol
         # If port/protocol not provided, pywiim will probe automatically
 
+        client_kwargs.pop("timeout", None)
         client = WiiMClient(**client_kwargs)
 
         # Wrap client in Player (recommended for HA - pywiim manages all state)
