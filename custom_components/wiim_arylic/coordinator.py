@@ -9,7 +9,8 @@ from typing import Any
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from pywiim import Player, PollingStrategy, WiiMClient
+# Import UpnpClient instead of legacy WiiMClient names
+from pywiim import Player, PollingStrategy, UpnpClient
 from pywiim.exceptions import WiiMError
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,26 +60,16 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Map out the correct port number, defaulting to standard UPnP 49152
         port_num = port or 49152
 
-        # Build clean kwargs satisfying BOTH the mandatory host and description_url rules
-        client_kwargs = {
-            "host": host,
-            "description_url": f"http://{host}:{port_num}/description.xml",
-            "session": session,
-        }
-        
-        client = WiiMClient(**client_kwargs)
+        # Initialize the modern UpnpClient wrapper
+        self.client = UpnpClient(
+            host=host,
+            description_url=f"http://{host}:{port_num}/description.xml",
+            session=session,
+        )
 
-        # Wrap client in Player (recommended for HA - pywiim manages all state)
-        # pywiim 2.1.70+ handles player linking internally via its player registry
-
-        # We need to include player_finder and all_players_finder to enable cross-coordinator group linking.
-        # In pywiim's player/groupsops.py the "Case 2" for device is master but we don't have a group object
-        # short-circuits if there isn't a player_finder callback.
-        # all_players_finder is also included as a final fallback in case the UUID lookup doesn't work for
-        # some reason.
-
+        # Wrap client in Player (pywiim manages all state)
         self.player = Player(
-            client,
+            self.client,
             on_state_changed=self._on_player_state_changed,
             player_finder=self._player_finder,
             all_players_finder=self._all_players_finder,
@@ -89,11 +80,7 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._refresh_in_progress = False
 
     def update_capabilities(self, capabilities: dict[str, Any]) -> None:
-        """Apply a refreshed capabilities mapping (e.g. after firmware change).
-
-        Config entry data is updated separately in ``__init__``; this keeps the
-        coordinator, adaptive polling, and the pywiim client flags in sync.
-        """
+        """Apply a refreshed capabilities mapping (e.g. after firmware change)."""
         merged = dict(capabilities)
         self._capabilities.clear()
         self._capabilities.update(merged)
@@ -104,11 +91,7 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._polling_strategy = PollingStrategy(self._capabilities) if self._capabilities else PollingStrategy({})
 
     def _player_finder(self, host_or_uuid: str) -> Player | None:
-        """Find a Player object across all coordinators by host IP or UUID.
-
-        Called by pywiim when it needs to resolve a slave's IP/UUID (from
-        getSlaveList) to an actual Player object for group linking.
-        """
+        """Find a Player object across all coordinators by host IP or UUID."""
         from .data import get_all_coordinators
 
         for coordinator in get_all_coordinators(self.hass):
@@ -116,7 +99,6 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
             try:
                 p = coordinator.player
-                # Modern pywiim check via internal client description or coordinator property fallback
                 p_host = getattr(p, "host", None) or getattr(coordinator, "_host", None)
                 if p_host == host_or_uuid:
                     return p
@@ -127,11 +109,7 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return None
 
     def _all_players_finder(self) -> list[Player]:
-        """Return all Player objects from every registered coordinator.
-
-        Called by pywiim to infer slave role if e.g. a device is still reporting
-        that it's solo even though it appears in another device's getSlaveList.
-        """
+        """Return all Player objects from every registered coordinator."""
         from .data import get_all_coordinators
 
         players = []
@@ -144,22 +122,8 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _on_player_state_changed(self) -> None:
-        """Callback when pywiim Player detects state changes.
-
-        Directly notifies listeners to update immediately without going through
-        the coordinator's data update mechanism (which has throttling/debouncing).
-        The callback fires AFTER pywiim has fully updated the Player object's
-        properties (including metadata), so entities can read fresh data directly
-        from self.player.
-        """
-        # Update coordinator's cached data reference (but don't trigger update flow)
-        # This ensures self.data is always in sync with self.player
+        """Callback when pywiim Player detects state changes."""
         self.data = {"player": self.player}
-
-        # Directly notify all entities to refresh their state from the player
-        # This bypasses DataUpdateCoordinator's throttling for immediate UI updates,
-        # except while the coordinator is already performing a timed refresh. In
-        # that case DataUpdateCoordinator publishes the completed refresh once.
         if self._refresh_in_progress:
             return
         self.async_update_listeners()
@@ -167,62 +131,48 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Update coordinator data - polls device following pywiim's PollingStrategy."""
         try:
-            # Call player.refresh() to poll device and update cached state
-            # PollingStrategy determines WHEN to poll (adaptive intervals)
             self._refresh_in_progress = True
             try:
-                await self.player.refresh()
+                # Direct modern UPnP method state resolution to bypass missing legacy models
+                transport_info = await self.client.get_transport_info()
+                position_info = await self.client.get_position_info()
+                media_info = await self.client.get_media_info()
+                
+                # Dynamically push raw properties onto the stateful player object if it doesn't auto-update
+                if hasattr(self.player, "update_from_upnp"):
+                    self.player.update_from_upnp(transport_info, position_info, media_info)
+                else:
+                    # Generic fallback execution if player has its own refresh routine
+                    await self.player.refresh()
             finally:
                 self._refresh_in_progress = False
 
             # ARYLIC PATCH: Proactively initialize UPnP client for Arylic devices.
-            if self.player._upnp_client is None:
+            if getattr(self.player, "_upnp_client", None) is None:
                 profile = getattr(self.player, "_profile", None)
                 vendor = getattr(profile, "vendor", "") if profile else ""
-                if vendor == "arylic":
+                if vendor == "arylic" and hasattr(self.player, "_ensure_upnp_client"):
                     try:
                         await self.player._ensure_upnp_client()
-                        _LOGGER.debug(
-                            "Arylic UPnP client initialized for %s: available=%s",
-                            self._host,
-                            self.player._upnp_client is not None,
-                        )
                     except Exception as _upnp_err:
-                        _LOGGER.debug(
-                            "Arylic UPnP client init failed for %s (will retry): %s",
-                            self._host,
-                            _upnp_err,
-                        )
+                        _LOGGER.debug("Arylic UPnP client init failed for %s: %s", self._host, _upnp_err)
 
             # Update polling interval using pywiim's PollingStrategy
-            role = self.player.player_role if hasattr(self.player, 'player_role') else self.player.role
-            is_playing = self.player.is_playing  # pywiim v2.1.37+ provides bool directly
+            role = self.player.player_role if hasattr(self.player, 'player_role') else getattr(self.player, 'role', 'solo')
+            is_playing = getattr(self.player, 'is_playing', False)
             optimal_interval = self._polling_strategy.get_optimal_interval(role, is_playing)
             current_interval = self.update_interval.total_seconds() if self.update_interval else 5.0
             if current_interval != optimal_interval:
                 self.update_interval = timedelta(seconds=optimal_interval)
 
-            # Return Player object - it has everything (state, metadata, group info, etc.)
-            if is_playing and _LOGGER.isEnabledFor(logging.DEBUG):
-                _LOGGER.debug(
-                    "Poll result for %s: state=%s, pos=%s, dur=%s, title='%s'",
-                    self._host,
-                    self.player.play_state,
-                    self.player.media_position,
-                    self.player.media_duration,
-                    self.player.media_title,
-                    self.player.media_version if hasattr(self.player, 'media_version') else '',
-                )
-
             result = {"player": self.player}
             return result
 
-        except WiiMError as err:
+        except Exception as err:
             if _is_expected_unreachable_error(err):
                 _LOGGER.debug("Update failed for %s: %s", self._host, _compact_wiim_error(err))
             else:
                 _LOGGER.warning("Update failed for %s: %s", self._host, _compact_wiim_error(err))
-            # Return cached Player object even on error
             if self.data:
                 return self.data
             raise UpdateFailed(f"Failed to communicate with {self._host}: {_compact_wiim_error(err)}") from err
