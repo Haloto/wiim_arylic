@@ -1,0 +1,203 @@
+# WiiM Integration Actions (Services)
+# Human-readable names and descriptions are in strings.json
+
+play_preset:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    preset:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 20
+    index:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 10000
+
+play_url:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    url:
+      required: true
+      selector:
+        text:
+
+play_playlist:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    playlist_url:
+      required: true
+      selector:
+        text:
+
+set_eq:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    preset:
+      required: true
+      selector:
+        select:
+          options:
+            - "flat"
+            - "classical"
+            - "jazz"
+            - "vocal"
+            - "pop"
+            - "rock"
+            - "dance"
+            - "country"
+            - "blues"
+            - "custom"
+    custom_values:
+      required: false
+      selector:
+        object:
+
+play_notification:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    url:
+      required: true
+      selector:
+        text:
+
+reboot_device:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+
+sync_time:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+
+set_sleep_timer:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    sleep_time:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 7200
+          unit_of_measurement: seconds
+
+clear_sleep_timer:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+
+update_alarm:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    alarm_id:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 2
+          mode: box
+    time:
+      required: false
+      selector:
+        text:
+    trigger:
+      required: false
+      selector:
+        text:
+    operation:
+      required: false
+      selector:
+        text:
+
+play_queue:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    queue_position:
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10000
+          mode: box
+
+remove_from_queue:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    queue_position:
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10000
+          mode: box
+
+get_queue:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+
+scan_bluetooth:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    duration:
+      required: false
+      default: 5
+      selector:
+        number:
+          min: 3
+          max: 10
+
+set_channel_balance:
+  target:
+    entity:
+      domain: media_player
+      integration: wiim
+  fields:
+    balance:
+      required: true
+      selector:
+        number:
+          min: -1.0
+          max: 1.0
+          step: 0.1
+          mode: slider

@@ -1,0 +1,757 @@
+"""WiiM Media Player integration for Home Assistant."""
+
+# ---------------------------------------------------------------------------
+# Test Environment Compatibility Shim
+# ---------------------------------------------------------------------------
+# When running unit tests outside of Home Assistant, the real "homeassistant"
+# package is typically not installed.  Attempting to import it will therefore
+# raise a ``ModuleNotFoundError`` long before pytest fixtures have a chance to
+# insert the stub package.  To make the component self-contained for testing we
+# fall back to the lightweight stubs located under the top-level *stubs/*
+# directory whenever the import fails.  This keeps the production codepath
+# untouched while allowing `pytest` to execute in a vanilla virtualenv.
+#
+# ``stubs/homeassistant/__init__.py`` intentionally registers **itself** and
+# all of the sub-modules the integration relies on into ``sys.modules``.  Once
+# that module has been imported exactly once, subsequent ``import homeassistant``
+# statements throughout the codebase succeed transparently.
+# ---------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+try:
+    import homeassistant  # noqa: F401 – try real package first
+except ModuleNotFoundError:  # pragma: no cover – only executed in test env
+    # Add <repo-root>/stubs to ``sys.path`` and retry the import.  We cannot
+    # rely on relative imports here because the integration may live two or
+    # more levels deep inside *custom_components/*.
+    repo_root = Path(__file__).resolve().parents[2]
+    stubs_path = repo_root / "stubs"
+    sys.path.append(str(stubs_path))
+
+    # Import the stub package which will register itself in ``sys.modules``.
+    import importlib
+
+    importlib.import_module("homeassistant")
+
+import logging
+from typing import Any
+from urllib.parse import urlparse
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
+from pywiim import WiiMClient
+from pywiim.discovery import discover_devices
+from pywiim.exceptions import WiiMConnectionError, WiiMError, WiiMRequestError, WiiMTimeoutError
+
+# Import config_flow to make it available as a module attribute for tests
+from . import config_flow  # noqa: F401
+from .const import (
+    CONF_ENABLE_MAINTENANCE_BUTTONS,
+    DOMAIN,
+)
+from .coordinator import WiiMCoordinator
+from .version import (
+    REQUIRED_PYWIIM_VERSION,
+    async_ensure_pywiim_version,
+    get_pywiim_version_label,
+    is_pywiim_version_compatible,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_expected_unreachable_error(err: Exception) -> bool:
+    """Return True when error indicates expected offline/unreachable device."""
+    err_text = str(err).lower()
+    return "device unreachable" in err_text or "connection failed on all attempted protocols" in err_text
+
+
+def _compact_connectivity_error(err: Exception) -> str:
+    """Return compact connectivity error string to reduce log noise."""
+    if _is_expected_unreachable_error(err):
+        return "device unreachable"
+    return str(err)
+
+
+async def _try_rebind_host_from_uuid(hass: HomeAssistant, entry: ConfigEntry) -> str | None:
+    """Try to rediscover and rebind host by config entry UUID.
+
+    Returns the new host when a different host is found and the entry is updated,
+    otherwise returns None.
+    """
+    device_uuid = entry.unique_id
+    current_host = entry.data.get("host")
+    if not device_uuid:
+        return None
+
+    try:
+        # Keep timeout short to avoid long setup delays on every retry.
+        discovered = await discover_devices(validate=True, ssdp_timeout=3)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug(
+            "Host rebind discovery failed for %s (uuid=%s): %s",
+            current_host,
+            device_uuid,
+            err,
+        )
+        return None
+
+    match = next((device for device in discovered if device.uuid == device_uuid and device.ip), None)
+    if not match:
+        return None
+    if match.ip == current_host:
+        return None
+
+    updated_data = {**entry.data, "host": match.ip}
+    # Endpoint is host-specific; force a fresh probe on next setup.
+    updated_data.pop("endpoint", None)
+    hass.config_entries.async_update_entry(entry, data=updated_data)
+    _LOGGER.warning(
+        "Detected host change for %s (uuid=%s): %s -> %s",
+        entry.title or "WiiM device",
+        device_uuid,
+        current_host,
+        match.ip,
+    )
+    return match.ip
+
+
+# Core platforms that are always enabled
+CORE_PLATFORMS: list[Platform] = [
+    Platform.MEDIA_PLAYER,  # Always enabled - core functionality
+    Platform.SENSOR,  # Always enabled - role sensor is essential for multiroom
+    Platform.NUMBER,  # Always enabled - subwoofer level control (if subwoofer connected)
+    Platform.LIGHT,  # Always enabled - front-panel LED control
+    Platform.SELECT,  # Always enabled - audio output mode control and Bluetooth device selection
+    Platform.BUTTON,  # Always enabled - Bluetooth scan button (maintenance buttons are optional)
+    Platform.SWITCH,  # Always enabled - subwoofer enable/disable (if subwoofer connected)
+]
+
+# Essential optional platforms based on user configuration
+OPTIONAL_PLATFORMS: dict[str, Platform] = {
+    CONF_ENABLE_MAINTENANCE_BUTTONS: Platform.BUTTON,  # Note: BUTTON is in CORE but maintenance buttons are optional
+}
+
+
+def get_enabled_platforms(
+    hass: HomeAssistant, entry: ConfigEntry, capabilities: dict[str, Any] | None = None
+) -> list[Platform]:
+    """Get list of platforms that should be enabled based on user options and device capabilities.
+
+    Args:
+        hass: Home Assistant instance
+        entry: Config entry
+        capabilities: Device capabilities dict (if not provided, will try to get from coordinator)
+    """
+    platforms = CORE_PLATFORMS.copy()
+
+    # Firmware UPDATE platform: use merged capability dict only (live client wins).
+    caps: dict[str, Any] = dict(capabilities or entry.data.get("capabilities") or {})
+    try:
+        coordinator: WiiMCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+        caps.update(dict(coordinator.player.client.capabilities))
+    except (KeyError, AttributeError, TypeError):
+        pass
+
+    if bool(caps.get("supports_firmware_install")):
+        platforms.append(Platform.UPDATE)
+
+    # Add optional platforms based on user preferences
+    # Note: BUTTON is in CORE_PLATFORMS (for Bluetooth scan), but maintenance buttons are optional
+    for config_key, platform in OPTIONAL_PLATFORMS.items():
+        # Skip if platform is already in core platforms
+        if platform in platforms:
+            _LOGGER.debug("Platform %s already enabled in core, skipping optional check", platform)
+            continue
+        # All optional platforms default to disabled unless the user opts in
+        default_enabled = False
+        if entry.options.get(config_key, default_enabled):
+            platforms.append(platform)
+            _LOGGER.debug("Enabling platform %s based on option %s", platform, config_key)
+
+    _LOGGER.debug(
+        "Enabled platforms for %s: %s",
+        entry.title or entry.data.get("host", entry.entry_id),
+        [p.value for p in platforms],
+    )
+    return platforms
+
+
+async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle options updates by reloading the entry."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _register_ha_device(hass: HomeAssistant, coordinator: WiiMCoordinator, entry: ConfigEntry) -> None:
+    """Register device in HA registry.
+
+    Device Info display:
+    - Hardware: Device firmware version (e.g., "Linkplay 4.8.731953")
+    - Software: PyWiiM library version (e.g., "pywiim 2.0.17")
+    - Serial Number: Device IP address
+    - Connections: Device MAC address
+    """
+    dev_reg = dr.async_get(hass)
+    uuid = entry.unique_id or coordinator.player.host
+    identifiers = {(DOMAIN, uuid)}
+
+    # Get pywiim library version
+    await async_ensure_pywiim_version(hass)
+    pywiim_version = get_pywiim_version_label()
+
+    # Get device info from player
+    player = coordinator.player
+    device_name = player.name or entry.title or "WiiM Speaker"
+    device_model = player.model or "WiiM Speaker"
+    firmware = player.firmware
+
+    # Get MAC address from device_info if available
+    mac_address = None
+    if player.device_info and hasattr(player.device_info, "mac"):
+        mac_address = player.device_info.mac
+
+    # Build connections set with MAC address if available
+    connections: set[tuple[str, str]] = set()
+    if mac_address:
+        connections.add((CONNECTION_NETWORK_MAC, mac_address))
+
+    dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers=identifiers,
+        manufacturer="WiiM",
+        name=device_name,
+        model=device_model,
+        hw_version=firmware,  # Device firmware (LinkPlay)
+        sw_version=pywiim_version,  # Integration library version
+        serial_number=player.host,  # IP address as serial number
+        connections=connections if connections else None,  # MAC address as connection
+    )
+
+
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Set up the WiiM integration domain."""
+    _LOGGER.debug("WiiM integration async_setup called")
+    # Initialize domain data structure
+    hass.data.setdefault(DOMAIN, {})
+
+    # Services are now registered via EntityServiceDescription pattern in media_player.py
+    # No need to register here - services are registered when entities are added
+
+    _LOGGER.debug("WiiM integration async_setup completed")
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up WiiM from a config entry."""
+    _LOGGER.debug(
+        "WiiM async_setup_entry called for entry: %s (host: %s)", entry.entry_id, entry.data.get("host")
+    )
+
+    # Initialize domain data structure
+    if DOMAIN not in hass.data:
+        hass.data[DOMAIN] = {}
+
+    # Services are registered via EntityServiceDescription pattern in media_player.py
+    # when entities are added to the platform
+
+    installed_pywiim_version = await async_ensure_pywiim_version(hass)
+    if not is_pywiim_version_compatible(installed_pywiim_version):
+        _LOGGER.error(
+            "pywiim %s does not match this integration's required version (%s). "
+            "Home Assistant must update dependencies before setup can continue.",
+            installed_pywiim_version,
+            REQUIRED_PYWIIM_VERSION,
+        )
+        raise ConfigEntryNotReady(
+            f"pywiim {REQUIRED_PYWIIM_VERSION} required; found {installed_pywiim_version}. "
+            "Please restart Home Assistant to refresh integration dependencies."
+        )
+
+    # Create client and coordinator with firmware capabilities
+    session = async_get_clientsession(hass)
+
+    # Check if we have a cached endpoint from previous discovery (optimized pattern)
+    cached_endpoint = entry.data.get("endpoint")
+    port = None
+    protocol = None
+    if cached_endpoint:
+        # Parse cached endpoint and extract port/protocol
+        parsed = urlparse(cached_endpoint)
+        port = parsed.port
+        protocol = parsed.scheme
+        _LOGGER.debug(
+            "Using cached endpoint for %s: %s (protocol=%s, port=%s)",
+            entry.data["host"],
+            cached_endpoint,
+            protocol,
+            port,
+        )
+
+    # Create client - pywiim handles capability detection
+    # Note: We pass Home Assistant's managed session to pywiim, but pywiim may create
+    # additional internal sessions for temporary operations (e.g., getting master name)
+    # that aren't properly closed. This results in "Unclosed client session" warnings
+    # which are harmless but should be fixed in pywiim itself.
+    #
+    # OPTIMIZATION: Check for cached capabilities first to avoid slow re-probing
+    # on every restart. Capabilities are cached after first successful detection.
+    #
+    # Cache invalidation:
+    # Re-detect capabilities when pywiim version changes. Firmware changes are
+    # checked after first refresh (live firmware availability).
+    cached_capabilities = entry.data.get("capabilities")
+    cache_meta = entry.data.get("capabilities_cache_meta") or {}
+    pre_detection_cap_firmware = cache_meta.get("firmware_version")
+    cached_pywiim_version = cache_meta.get("pywiim_version")
+    versions_match = cached_pywiim_version == installed_pywiim_version
+    capabilities: dict[str, Any] = {}
+    # When true, we skipped HTTP capability probing and used config-entry cache.
+    # pywiim may still need refresh_capabilities() to merge keys added in the same
+    # pywiim version (e.g. supports_subwoofer) that older cache files omit.
+    used_capability_cache = bool(cached_capabilities and versions_match)
+
+    # Capabilities are cached for startup performance. Reuse cache only when it
+    # was generated by the same pywiim version.
+    if cached_capabilities and versions_match:
+        # Use cached capabilities - skip slow probing
+        capabilities = cached_capabilities
+        _LOGGER.debug(
+            "Using cached capabilities for %s: %s (pywiim=%s)",
+            entry.data["host"],
+            capabilities.get("device_type", "Unknown"),
+            cached_pywiim_version,
+        )
+    else:
+        if cached_capabilities and not versions_match:
+            _LOGGER.debug(
+                "Capability cache invalidated for %s: pywiim %s->%s",
+                entry.data["host"],
+                cached_pywiim_version or "unknown",
+                installed_pywiim_version,
+            )
+        # First setup, no cache, or stale cache - need to detect capabilities
+        try:
+            import time
+
+            start_time = time.monotonic()
+
+            # Use cached endpoint if available, otherwise let pywiim probe automatically
+            temp_client_kwargs = {
+                "host": entry.data["host"],
+                "timeout": entry.data.get("timeout", 10),
+                "session": session,
+            }
+            if port is not None and protocol is not None:
+                temp_client_kwargs["port"] = port
+                temp_client_kwargs["protocol"] = protocol
+            temp_client = WiiMClient(**temp_client_kwargs)
+            # Use pywiim's _detect_capabilities() method
+            detected = await temp_client._detect_capabilities()
+
+            # Merge any existing cached capabilities (if present) with the newly detected ones.
+            # Prefer freshly detected values to avoid stale flags (like firmware install support).
+            if cached_capabilities:
+                capabilities = {**cached_capabilities, **(detected or {})}
+            else:
+                capabilities = detected or {}
+
+            elapsed = time.monotonic() - start_time
+            _LOGGER.debug(
+                "Detected device capabilities for %s in %.2fs: %s",
+                entry.data["host"],
+                elapsed,
+                capabilities.get("device_type", "Unknown"),
+            )
+
+            # Cache capabilities for faster future startups
+            if capabilities:
+                _LOGGER.debug("Caching capabilities for %s", entry.data["host"])
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **entry.data,
+                        "capabilities": capabilities,
+                        "capabilities_cache_meta": {
+                            "pywiim_version": installed_pywiim_version,
+                            "firmware_version": capabilities.get("firmware_version"),
+                        },
+                    },
+                )
+
+            # Log audio output / EQ capability for troubleshooting (default log stays quiet)
+            if capabilities.get("supports_audio_output"):
+                _LOGGER.debug(
+                    "[AUDIO OUTPUT] Device %s supports audio output control",
+                    entry.data["host"],
+                )
+            else:
+                _LOGGER.debug(
+                    "[AUDIO OUTPUT] Device %s does not support audio output control",
+                    entry.data["host"],
+                )
+            if capabilities.get("supports_eq"):
+                _LOGGER.debug(
+                    "[EQ] Device %s supports EQ (detected by pywiim capability detection)",
+                    entry.data["host"],
+                )
+            else:
+                _LOGGER.debug(
+                    "[EQ] Device %s - EQ support NOT detected by pywiim capability detection. Full capabilities: %s",
+                    entry.data["host"],
+                    capabilities,
+                )
+        except Exception as err:
+            # Smart logging escalation for capability detection failures
+            retry_count = getattr(entry, "_capability_detection_retry_count", 0)
+            retry_count += 1
+            entry._capability_detection_retry_count = retry_count
+
+            # Escalate logging based on retry count
+            if retry_count <= 2:
+                log_fn = _LOGGER.warning
+            elif retry_count <= 4:
+                log_fn = _LOGGER.debug
+            else:
+                log_fn = _LOGGER.error
+
+            log_fn(
+                "Failed to detect device capabilities for %s (attempt %d): %s",
+                entry.data["host"],
+                retry_count,
+                err,
+            )
+            # Use empty capabilities - WiiMClient will handle it
+            capabilities = {}
+
+    # Coordinator creates client and player internally using HA's shared session
+    # Pass port/protocol if we have a cached endpoint, otherwise let pywiim probe
+    coordinator = WiiMCoordinator(
+        hass,
+        host=entry.data["host"],
+        entry=entry,
+        capabilities=capabilities,
+        port=port,
+        protocol=protocol,
+        timeout=entry.data.get("timeout", 10),
+    )
+
+    # Store coordinator and entry directly in hass.data
+    hass.data[DOMAIN][entry.entry_id] = {
+        "coordinator": coordinator,
+        "entry": entry,  # platform access to options
+    }
+
+    # Listen for config entry updates (e.g. options flow) so we can reload
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
+
+    _LOGGER.debug(
+        "WiiM coordinator created for %s with adaptive polling (1s when playing, 5s when idle)",
+        entry.data["host"],
+    )
+
+    # Initial data fetch with proper error handling
+    try:
+        _LOGGER.debug("Starting initial data fetch for %s", entry.data["host"])
+        await coordinator.async_config_entry_first_refresh()
+        _LOGGER.debug("Initial data fetch completed for %s", entry.data["host"])
+
+        # Cached capabilities skip client-side detection on construction; merge any
+        # new capability keys from the current pywiim (e.g. supports_subwoofer) once
+        # the device is reachable (pywiim 2.2.2+ refresh_capabilities).
+        if used_capability_cache:
+            client = coordinator.player.client
+            refresh_fn = getattr(client, "refresh_capabilities", None)
+            if callable(refresh_fn):
+                try:
+                    await refresh_fn()
+                    merged_caps = dict(client.capabilities)
+                    coordinator.update_capabilities(merged_caps)
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={
+                            **entry.data,
+                            "capabilities": merged_caps,
+                            "capabilities_cache_meta": {
+                                "pywiim_version": installed_pywiim_version,
+                                "firmware_version": merged_caps.get("firmware_version")
+                                or getattr(coordinator.player, "firmware", None),
+                            },
+                        },
+                    )
+                    capabilities = merged_caps
+                    _LOGGER.debug(
+                        "Merged refreshed pywiim capabilities after cached startup for %s",
+                        entry.data["host"],
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "refresh_capabilities after cached startup skipped for %s: %s",
+                        entry.data["host"],
+                        err,
+                    )
+
+        # Firmware-aware cache invalidation:
+        # Live firmware is only reliable after first refresh. If it differs from
+        # the firmware version stored in cached capabilities, re-detect
+        # capabilities now so new firmware features are reflected immediately.
+        runtime_firmware = getattr(coordinator.player, "firmware", None)
+        cached_cap_firmware = pre_detection_cap_firmware
+        if runtime_firmware and cached_cap_firmware and runtime_firmware != cached_cap_firmware:
+            _LOGGER.debug(
+                "Capability cache invalidated for %s due to firmware change: %s -> %s",
+                entry.data["host"],
+                cached_cap_firmware,
+                runtime_firmware,
+            )
+            try:
+                client = coordinator.player.client
+                try:
+                    refreshed_capabilities = await client._detect_capabilities(force=True)
+                except TypeError:
+                    # pywiim without ``force`` (older release): best-effort cache return only.
+                    refreshed_capabilities = await client._detect_capabilities()
+                if refreshed_capabilities:
+                    capabilities = {**(entry.data.get("capabilities") or {}), **refreshed_capabilities}
+                    # Keep cache metadata aligned with the actual runtime firmware.
+                    capabilities["firmware_version"] = runtime_firmware
+                    coordinator.update_capabilities(capabilities)
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={
+                            **entry.data,
+                            "capabilities": capabilities,
+                            "capabilities_cache_meta": {
+                                "pywiim_version": installed_pywiim_version,
+                                "firmware_version": runtime_firmware,
+                            },
+                        },
+                    )
+                    _LOGGER.debug(
+                        "Refreshed capabilities after firmware change for %s",
+                        entry.data["host"],
+                    )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Failed to refresh capabilities after firmware change for %s: %s",
+                    entry.data["host"],
+                    err,
+                )
+        elif runtime_firmware and cached_cap_firmware is None:
+            _LOGGER.debug(
+                "Skipping firmware-based capability invalidation for %s: no cached firmware_version metadata",
+                entry.data["host"],
+            )
+
+        # After first successful connection, persist the discovered endpoint (optimized pattern)
+        # This avoids probing on every startup for faster initialization
+        if not cached_endpoint:
+            discovered_endpoint = coordinator.player.client.discovered_endpoint
+            if discovered_endpoint:
+                _LOGGER.debug(
+                    "Caching discovered endpoint for %s: %s",
+                    entry.data["host"],
+                    discovered_endpoint,
+                )
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={**entry.data, "endpoint": discovered_endpoint},
+                )
+
+        # Update config entry title if we now have the real device name
+        # This fixes manual add showing "WiiM Device (IP)" instead of actual name
+        player_name = coordinator.player.name
+        if player_name and entry.title != player_name:
+            # Only update if current title is a generic fallback name
+            host = entry.data.get("host", "")
+            is_generic_title = entry.title.startswith("WiiM Device") or entry.title == host
+            if is_generic_title:
+                _LOGGER.debug("Updating config entry title to '%s'", player_name)
+                hass.config_entries.async_update_entry(entry, title=player_name)
+
+        # Register device in HA registry now that we have fresh coordinator data
+        _LOGGER.debug("Registering device for %s", entry.data["host"])
+        try:
+            await _register_ha_device(hass, coordinator, entry)
+            _LOGGER.debug("Device registration completed for %s", entry.data["host"])
+        except Exception as setup_err:  # noqa: BLE001
+            _LOGGER.error(
+                "Device registration failed for %s: %s",
+                entry.data["host"],
+                setup_err,
+                exc_info=True,
+            )
+            # Re-raise to let outer handler deal with it
+            raise
+
+        # Reset retry count on successful setup
+        if hasattr(entry, "_setup_retry_count") and entry._setup_retry_count > 0:
+            _LOGGER.debug(
+                "Setup succeeded for %s after %d retries",
+                entry.data["host"],
+                entry._setup_retry_count,
+            )
+            entry._setup_retry_count = 0
+
+    except (WiiMTimeoutError, WiiMConnectionError, WiiMError) as err:
+        # Cleanup partial registration before signaling retry
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+
+        # Smart logging escalation to reduce noise for persistent failures
+        # Track retry count across attempts (stored in config entry runtime data)
+        retry_count = getattr(entry, "_setup_retry_count", 0)
+        retry_count += 1
+        entry._setup_retry_count = retry_count
+
+        # Escalate logging based on retry count to reduce noise
+        if retry_count <= 2:
+            log_fn = _LOGGER.warning  # First couple attempts - normal to see
+        elif retry_count <= 4:
+            log_fn = _LOGGER.debug  # Middle attempts - reduce noise
+        else:
+            log_fn = _LOGGER.error  # Many attempts - device likely offline
+
+        rebind_host = await _try_rebind_host_from_uuid(hass, entry)
+        if rebind_host:
+            raise ConfigEntryNotReady(
+                f"Device rediscovered at {rebind_host}; updated host and retrying setup."
+            ) from err
+
+        if isinstance(err, WiiMTimeoutError):
+            log_fn(
+                "Timeout fetching initial data from %s (attempt %d), will retry: %s",
+                entry.data["host"],
+                retry_count,
+                _compact_connectivity_error(err),
+            )
+            raise ConfigEntryNotReady(f"Timeout connecting to WiiM device at {entry.data['host']}") from err
+        if isinstance(err, WiiMConnectionError):
+            log_fn(
+                "Connection error fetching initial data from %s (attempt %d), will retry: %s",
+                entry.data["host"],
+                retry_count,
+                _compact_connectivity_error(err),
+            )
+            raise ConfigEntryNotReady(f"Connection error with WiiM device at {entry.data['host']}") from err
+        _LOGGER.error(
+            "API error fetching initial data from %s: %s",
+            entry.data["host"],
+            _compact_connectivity_error(err),
+        )
+        raise ConfigEntryNotReady(f"API error with WiiM device at {entry.data['host']}") from err
+    except Exception as err:
+        # Cleanup on error and re-raise (ConfigEntryNotReady from coordinator, or unexpected)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+
+        # Walk __cause__ chain to find WiiM exception (coordinator wraps: ConfigEntryNotReady -> UpdateFailed -> WiiMRequestError)
+        def _find_wiim_cause(exc: BaseException | None) -> BaseException | None:
+            while exc:
+                if isinstance(exc, (WiiMTimeoutError, WiiMConnectionError, WiiMRequestError, WiiMError)):
+                    return exc
+                exc = getattr(exc, "__cause__", None)
+            return None
+
+        wiim_cause = _find_wiim_cause(err)
+        is_connectivity_error = isinstance(wiim_cause, (WiiMConnectionError, WiiMTimeoutError, WiiMRequestError))
+
+        # Smart logging escalation to reduce noise for persistent failures
+        retry_count = getattr(entry, "_setup_retry_count", 0)
+        retry_count += 1
+        entry._setup_retry_count = retry_count
+        if retry_count <= 2:
+            log_fn = _LOGGER.warning
+        elif retry_count <= 4:
+            log_fn = _LOGGER.debug
+        else:
+            log_fn = _LOGGER.error
+
+        # For connectivity errors: log cleanly without traceback (expected failure mode)
+        if is_connectivity_error:
+            err_msg = _compact_connectivity_error(wiim_cause if wiim_cause else err)
+            rebind_host = await _try_rebind_host_from_uuid(hass, entry)
+            if rebind_host:
+                raise ConfigEntryNotReady(
+                    f"Device rediscovered at {rebind_host}; updated host and retrying setup."
+                ) from err
+            if isinstance(wiim_cause, WiiMConnectionError):
+                log_fn(
+                    "Connection error fetching initial data from %s (attempt %d), will retry: %s",
+                    entry.data["host"],
+                    retry_count,
+                    err_msg,
+                )
+                raise ConfigEntryNotReady(f"Connection error with WiiM device at {entry.data['host']}") from err
+            if isinstance(wiim_cause, WiiMTimeoutError):
+                log_fn(
+                    "Timeout fetching initial data from %s (attempt %d), will retry: %s",
+                    entry.data["host"],
+                    retry_count,
+                    err_msg,
+                )
+                raise ConfigEntryNotReady(f"Timeout connecting to WiiM device at {entry.data['host']}") from err
+            # WiiMRequestError (wraps connection errors)
+            log_fn(
+                "Device unreachable at %s (attempt %d), will retry: %s",
+                entry.data["host"],
+                retry_count,
+                err_msg,
+            )
+            raise ConfigEntryNotReady(f"Device unreachable at {entry.data['host']}") from err
+
+        # Truly unexpected errors: log with traceback for debugging
+        log_fn(
+            "Unexpected error fetching initial data from %s (attempt %d): %s",
+            entry.data["host"],
+            retry_count,
+            err,
+            exc_info=True,
+        )
+        raise
+
+    # Use live client capabilities so platform gating matches post-refresh state
+    # (firmware OTA path, refresh_capabilities merge, etc.).
+    capabilities = dict(coordinator.player.client.capabilities)
+
+    # Get enabled platforms based on user options and device capabilities
+    enabled_platforms = get_enabled_platforms(hass, entry, capabilities)
+
+    # Set up only enabled platforms
+    await hass.config_entries.async_forward_entry_setups(entry, enabled_platforms)
+
+    device_name = coordinator.player.name or entry.title or "WiiM Speaker"
+    _LOGGER.info("WiiM ready: %s", device_name)
+    _LOGGER.debug(
+        "WiiM integration setup complete for %s (UUID: %s) with %d platforms",
+        device_name,
+        entry.unique_id or "unknown",
+        len(enabled_platforms),
+    )
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    # Get the platforms that were actually set up
+    enabled_platforms = get_enabled_platforms(hass, entry)
+
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, enabled_platforms):
+        entry_data = hass.data[DOMAIN].pop(entry.entry_id, {})
+        coordinator = entry_data.get("coordinator")
+        if coordinator:
+            device_name = coordinator.player.name or entry.title or "WiiM Speaker"
+            _LOGGER.debug("Unloaded WiiM integration for %s", device_name)
+    return unload_ok
+
+
+async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload a config entry."""
+    await async_unload_entry(hass, entry)
+    await async_setup_entry(hass, entry)
