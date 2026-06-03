@@ -441,7 +441,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         capabilities=capabilities,
         port=port,
         protocol=protocol,
-        timeout=entry.data.get("timeout", 10),
+        # timeout=entry.data.get("timeout", 10),
     )
 
     # Store coordinator and entry directly in hass.data
