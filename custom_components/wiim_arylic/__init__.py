@@ -37,6 +37,39 @@ except ModuleNotFoundError:  # pragma: no cover – only executed in test env
 
     importlib.import_module("homeassistant")
 
+# ---------------------------------------------------------------------------
+# Arylic pywiim patch — shadow 4 pywiim modules with local patched versions.
+# This must run before any pywiim import so the patched modules are in
+# sys.modules when pywiim itself does its internal imports.
+# ---------------------------------------------------------------------------
+import importlib.util as _ilu
+from pathlib import Path as _Path
+
+_PYWIIM_LOCAL = _Path(__file__).parent / "pywiim_local"
+
+_PATCHES = [
+    ("pywiim.profiles",        _PYWIIM_LOCAL / "profiles.py",            "pywiim"),
+    ("pywiim.api.playback",    _PYWIIM_LOCAL / "api" / "playback.py",    "pywiim.api"),
+    ("pywiim.player.coverart", _PYWIIM_LOCAL / "player" / "coverart.py", "pywiim.player"),
+    ("pywiim.upnp.client",     _PYWIIM_LOCAL / "upnp" / "client.py",     "pywiim.upnp"),
+]
+
+for _target, _path, _package in _PATCHES:
+    if _target not in sys.modules:
+        try:
+            _spec = _ilu.spec_from_file_location(_target, _path)
+            _mod = _ilu.module_from_spec(_spec)
+            _mod.__package__ = _package
+            sys.modules[_target] = _mod
+            _spec.loader.exec_module(_mod)
+        except Exception as _patch_err:  # noqa: BLE001
+            sys.modules.pop(_target, None)  # roll back so original wiim isn't poisoned
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Arylic patch failed for %s: %s", _target, _patch_err
+            )
+# ---------------------------------------------------------------------------
+
 import logging
 from typing import Any
 from urllib.parse import urlparse
