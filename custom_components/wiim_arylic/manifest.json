@@ -14,7 +14,7 @@
   "issue_tracker": "https://github.com/Haloto/pywiim_arylic/issues",
   "quality_scale": "gold",
   "requirements": [
-    "pywiim @ git+https://github.com/Haloto/pywiim_arylic.git@main"
+    "pywiim==2.2.6 @ git+https://github.com/Haloto/pywiim_arylic.git@main"
   ],
   "ssdp": [
     {
