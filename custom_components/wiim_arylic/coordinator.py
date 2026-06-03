@@ -59,8 +59,9 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Map out the correct port number, defaulting to standard UPnP 49152
         port_num = port or 49152
 
-        # Build clean kwargs using the mandatory description_url rule for modern pywiim
+        # Build clean kwargs satisfying BOTH the mandatory host and description_url rules
         client_kwargs = {
+            "host": host,
             "description_url": f"http://{host}:{port_num}/description.xml",
             "session": session,
         }
@@ -194,7 +195,7 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
 
             # Update polling interval using pywiim's PollingStrategy
-            role = self.player.role
+            role = self.player.player_role if hasattr(self.player, 'player_role') else self.player.role
             is_playing = self.player.is_playing  # pywiim v2.1.37+ provides bool directly
             optimal_interval = self._polling_strategy.get_optimal_interval(role, is_playing)
             current_interval = self.update_interval.total_seconds() if self.update_interval else 5.0
