@@ -104,6 +104,11 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_upnp_play_state: str | None = None
         # Unsubscribe handle for the independent UPnP fast polling loop.
         self._upnp_loop_unsub: object | None = None
+        # Fast-path override dict: holds the most recent UPnP state that has
+        # not yet been confirmed by an HTTP poll.  Entities should prefer these
+        # values over player.* when present.  Cleared on every HTTP tick so
+        # the library's state takes over again once it catches up.
+        self.upnp_override: dict[str, Any] = {}
 
     def update_capabilities(self, capabilities: dict[str, Any]) -> None:
         """Apply a refreshed capabilities mapping (e.g. after firmware change).
@@ -203,6 +208,41 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._upnp_loop_unsub()
             self._upnp_loop_unsub = None
             _LOGGER.debug("UPnP fast loop stopped for %s", self.player.host)
+
+    @property
+    def effective_play_state(self) -> str | None:
+        """Return the most up-to-date play state.
+
+        Prefers the fast-path UPnP override (set by the 1-second fast loop)
+        over the library's HTTP-backed state.  The override is cleared at the
+        start of each HTTP coordinator tick so the library regains authority
+        once the HTTP poll has completed.
+        """
+        return self.upnp_override.get("play_state") or getattr(self.player, "play_state", None)
+
+    @property
+    def effective_media_position(self) -> float | None:
+        """Return the most up-to-date media position (seconds)."""
+        override = self.upnp_override.get("position")
+        if override is not None:
+            return override
+        return getattr(self.player, "media_position", None)
+
+    @property
+    def effective_media_duration(self) -> float | None:
+        """Return the most up-to-date media duration (seconds)."""
+        override = self.upnp_override.get("duration")
+        if override is not None:
+            return override
+        return getattr(self.player, "media_duration", None)
+
+    @property
+    def effective_media_image_url(self) -> str | None:
+        """Return the most up-to-date album art URL."""
+        override = self.upnp_override.get("image_url")
+        if override is not None:
+            return override
+        return getattr(self.player, "media_image_url", None)
 
     @callback
     def _async_upnp_loop_tick(self, _now: object) -> None:
@@ -304,6 +344,21 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except (AttributeError, TypeError):
                         pass
 
+            # Store fast-path override so entities can read it without relying
+            # on the library's merged state (which only updates after HTTP poll).
+            if new_play_state is not None:
+                self.upnp_override["play_state"] = new_play_state
+            if upnp_data.get("position") is not None:
+                self.upnp_override["position"] = upnp_data["position"]
+            if upnp_data.get("duration") is not None:
+                self.upnp_override["duration"] = upnp_data["duration"]
+            if new_image_url:
+                self.upnp_override["image_url"] = new_image_url
+            for field in ("title", "artist", "album"):
+                val = upnp_data.get(field)
+                if val:
+                    self.upnp_override[field] = val
+
             # Push immediately to HA — don't wait for the HTTP coordinator tick
             self.data = {"player": self.player}
             if not self._refresh_in_progress:
@@ -319,6 +374,10 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Update coordinator data - polls device following pywiim's PollingStrategy."""
         try:
+            # Clear fast-path override: the library's fresh HTTP state will now
+            # be authoritative.  Entities will read player.* directly again.
+            self.upnp_override.clear()
+
             # Call player.refresh() to poll device and update cached state
             # PollingStrategy determines WHEN to poll (adaptive intervals)
             # Pre-seed entity_picture from previous UPnP poll so that
