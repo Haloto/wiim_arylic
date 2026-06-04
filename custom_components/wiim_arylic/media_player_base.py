@@ -58,11 +58,26 @@ class WiiMMediaPlayerMixin:
         """Map pywiim's player state to MediaPlayerState.
 
         Uses pywiim v2.1.37+ clean state properties: is_playing, is_paused, is_buffering.
+        Prefers the coordinator UPnP fast-path override when present so that play/pause
+        state changes detected by the 1-second UPnP loop are reflected immediately,
+        without waiting for the HTTP coordinator cycle to complete.
         """
         if not self.available or not player:
             return None
 
-        # Use pywiim's clean state properties (v2.1.37+)
+        # Check fast-path override first (set by the UPnP fast loop in the coordinator).
+        # The override holds the UPnP-reported play_state string ("playing"/"paused"/"stopped")
+        # and is cleared at the start of each HTTP coordinator tick.
+        _upnp_state = getattr(self.coordinator, "upnp_override", {}).get("play_state")
+        if _upnp_state:
+            if _upnp_state == "playing":
+                return MediaPlayerState.PLAYING
+            if _upnp_state == "paused":
+                return MediaPlayerState.PAUSED
+            if _upnp_state == "stopped":
+                return MediaPlayerState.IDLE
+
+        # Fall back to pywiim's clean state properties (v2.1.37+)
         if player.is_playing:
             return MediaPlayerState.PLAYING
         if player.is_paused:
@@ -91,10 +106,17 @@ class WiiMMediaPlayerMixin:
         ):
             self._media_cleared_by_turn_off = False
 
-        # Get values from pywiim
-        new_position = player.media_position
+        # Get values — prefer fast-path UPnP override when present (coordinator fast loop
+        # provides these ahead of the HTTP poll to give instant position/duration updates).
+        _override = getattr(self.coordinator, "upnp_override", {})
+        new_position = _override.get("position") if _override else None
+        if new_position is None:
+            new_position = player.media_position
+        _raw_duration = _override.get("duration") if _override else None
+        if _raw_duration is None:
+            _raw_duration = player.media_duration
         # If duration is 0, return None (unknown) to avoid 00:00 display
-        new_duration = player.media_duration if player.media_duration else None
+        new_duration = _raw_duration if _raw_duration else None
         _LOGGER.debug(
             "[%s] Coordinator update (state=%s, raw_pos=%s, raw_dur=%s)",
             self.name,
@@ -216,6 +238,11 @@ class WiiMMediaPlayerMixin:
         player = self._get_metadata_player()
         if not player:
             return None
+
+        # Prefer fast-path UPnP override (set by 1-second fast loop before HTTP poll arrives)
+        _upnp_url = getattr(self.coordinator, "upnp_override", {}).get("image_url")
+        if _upnp_url:
+            return _upnp_url
 
         # If pywiim has a URL, use it directly
         # pywiim guarantees media_image_url is always a property (may be None)
