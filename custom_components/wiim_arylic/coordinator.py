@@ -98,8 +98,11 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # UPnP GetInfoEx poller for cover art (not available via HTTP API).
         # Uses HA's shared session - same one passed to WiiMClient above.
         self._upnp_poller = UpnpGetInfoExPoller(host=host, session=session)
-        # Track last injected image_url to avoid redundant state pushes.
+        # Track last injected values to detect changes and avoid redundant pushes.
         self._last_upnp_image_url: str | None = None
+        self._last_upnp_play_state: str | None = None
+        # Unsubscribe handle for the independent UPnP fast polling loop.
+        self._upnp_loop_unsub: object | None = None
 
     def update_capabilities(self, capabilities: dict[str, Any]) -> None:
         """Apply a refreshed capabilities mapping (e.g. after firmware change).
