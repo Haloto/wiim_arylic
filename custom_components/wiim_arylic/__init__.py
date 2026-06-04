@@ -37,8 +37,6 @@ except ModuleNotFoundError:  # pragma: no cover – only executed in test env
 
     importlib.import_module("homeassistant")
 
-
-
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -454,6 +452,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Listen for config entry updates (e.g. options flow) so we can reload
     entry.async_on_unload(entry.add_update_listener(_update_listener))
+
+    # Start the independent UPnP fast loop and register cleanup on unload.
+    # This loop polls GetInfoEx every second and pushes play/pause/track
+    # changes to HA immediately, without waiting for the slow HTTP cycle.
+    coordinator.start_upnp_loop()
+    entry.async_on_unload(coordinator.stop_upnp_loop)
 
     _LOGGER.debug(
         "WiiM coordinator created for %s with adaptive polling (1s when playing, 5s when idle)",
