@@ -180,6 +180,21 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             # Call player.refresh() to poll device and update cached state
             # PollingStrategy determines WHEN to poll (adaptive intervals)
+            # Pre-seed entity_picture from previous UPnP poll so that
+            # get_player_status() sees valid artwork and skips its bonus
+            # getMetaInfo HTTP request. That extra request fires on every
+            # tick when entity_picture is un_known/None (Spotify Connect
+            # on Linkplay returns un_known from the HTTP API), and is the
+            # primary cause of the 4-6s fetch times observed in the logs.
+            if self._last_upnp_image_url:
+                status_model = getattr(self.player, "_status_model", None)
+                if status_model is not None:
+                    for attr in ("entity_picture", "cover_url"):
+                        try:
+                            setattr(status_model, attr, self._last_upnp_image_url)
+                        except (AttributeError, TypeError):
+                            pass
+
             self._refresh_in_progress = True
             try:
                 await self.player.refresh()
@@ -255,44 +270,83 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             image_url: str | None = upnp_data.get("image_url")
 
-            # Nothing to inject
-            if not image_url:
-                return
+            # Skip full injection if nothing has changed at all.
+            # We check image_url as the proxy since it changes least frequently
+            # (title/artist/position change every second while playing).
+            # play_state and position are always injected regardless.
+            image_url_changed = image_url != self._last_upnp_image_url
+            if image_url and image_url_changed:
+                self._last_upnp_image_url = image_url
 
-            # Skip if unchanged
-            if image_url == self._last_upnp_image_url:
-                return
+            # --- Build injection payload ---
+            # Inject all fields GetInfoEx provides. Every field here has UPnP
+            # priority over HTTP in pywiim's SOURCE_PRIORITY, so these values
+            # will win the merge and replace the sluggish HTTP responses.
+            # Fields: play_state, position, duration, title, artist, album,
+            # image_url — exactly what update_from_upnp() accepts natively.
+            inject: dict = {}
 
-            self._last_upnp_image_url = image_url
+            if upnp_data.get("play_state") is not None:
+                inject["play_state"] = upnp_data["play_state"]
+
+            if upnp_data.get("position") is not None:
+                inject["position"] = upnp_data["position"]
+
+            if upnp_data.get("duration") is not None:
+                inject["duration"] = upnp_data["duration"]
+
+            # Only inject metadata when it's actually present (not None).
+            # Injecting None would overwrite valid HTTP metadata with nothing.
+            for field in ("title", "artist", "album"):
+                val = upnp_data.get(field)
+                if val:
+                    inject[field] = val
+
+            if image_url:
+                inject["image_url"] = image_url
+
+            if not inject:
+                return
 
             _LOGGER.debug(
-                "UPnP GetInfoEx: injecting cover art for %s: %s",
+                "UPnP GetInfoEx: injecting %s for %s",
+                list(inject.keys()),
                 self.player.host,
-                image_url,
             )
 
             # --- Inject into pywiim state machine ---
-            # update_from_upnp() accepts the same field names as update_from_http()
-            # including "image_url". It merges the value with correct source priority.
+            # update_from_upnp() handles all these fields natively and merges
+            # them with correct source priority (UPnP > HTTP for all of them).
             state_sync = getattr(self.player, "_state_synchronizer", None)
             if state_sync is not None and hasattr(state_sync, "update_from_upnp"):
-                state_sync.update_from_upnp(
-                    {"image_url": image_url},
-                    timestamp=time.time(),
-                )
+                state_sync.update_from_upnp(inject, timestamp=time.time())
 
-            # Belt-and-braces: also stamp the cached status model so
-            # PlayerProperties.media_image_url sees the new URL immediately
-            # (before the next full merge cycle).
+            # Belt-and-braces: stamp the cached status model so
+            # PlayerProperties sees position/duration/image_url immediately
+            # on the current tick before the next merge cycle.
             status_model = getattr(self.player, "_status_model", None)
             if status_model is not None:
-                # entity_picture and cover_url are the two fields checked by
-                # PlayerProperties._status_field("image_url", "entity_picture", "cover_url")
-                for attr in ("entity_picture", "cover_url"):
+                _model_map = {
+                    "position": "position",
+                    "duration": "duration",
+                    "play_state": "play_state",
+                    "title": "title",
+                    "artist": "artist",
+                    "album": "album",
+                    "image_url": "entity_picture",
+                }
+                for inject_key, model_attr in _model_map.items():
+                    if inject_key in inject:
+                        try:
+                            setattr(status_model, model_attr, inject[inject_key])
+                        except (AttributeError, TypeError):
+                            pass
+                # cover_url mirrors entity_picture
+                if "image_url" in inject:
                     try:
-                        setattr(status_model, attr, image_url)
+                        setattr(status_model, "cover_url", inject["image_url"])
                     except (AttributeError, TypeError):
-                        pass  # read-only or non-existent on this pywiim version
+                        pass
 
         except Exception as err:  # noqa: BLE001
             # Never let cover art polling break the main update
