@@ -226,6 +226,33 @@ class UpnpGetInfoExPoller:
         position = self._hms_to_seconds(_get("RelTime"))
         duration = self._hms_to_seconds(_get("TrackDuration"))
 
+        # Volume: raw 0-100 integer → normalise to 0.0-1.0 float (HA convention)
+        volume_level: float | None = None
+        raw_vol = _get("CurrentVolume")
+        if raw_vol is not None:
+            try:
+                volume_level = max(0.0, min(1.0, int(raw_vol) / 100.0))
+            except (ValueError, TypeError):
+                pass
+
+        # Mute: CurrentChannel — 0 = not muted, 1 = muted
+        is_muted: bool | None = None
+        raw_ch = _get("CurrentChannel")
+        if raw_ch is not None:
+            try:
+                is_muted = int(raw_ch) != 0
+            except (ValueError, TypeError):
+                pass
+
+        # LoopMode: raw integer — kept as-is; coordinator maps to shuffle/repeat
+        loop_mode: int | None = None
+        raw_loop = _get("LoopMode")
+        if raw_loop is not None:
+            try:
+                loop_mode = int(raw_loop)
+            except (ValueError, TypeError):
+                pass
+
         meta_raw = _get("TrackMetaData")
         metadata = _parse_didl(meta_raw) if meta_raw else {}
 
@@ -233,14 +260,20 @@ class UpnpGetInfoExPoller:
             "play_state": play_state,
             "position": position,
             "duration": duration,
+            "volume_level": volume_level,
+            "is_muted": is_muted,
+            "loop_mode": loop_mode,
             **metadata,
         }
 
         _LOGGER.debug(
-            "GetInfoEx result: state=%s pos=%s/%s title=%r art=%s",
+            "GetInfoEx result: state=%s pos=%s/%s vol=%s muted=%s loop=%s title=%r art=%s",
             play_state,
             position,
             duration,
+            volume_level,
+            is_muted,
+            loop_mode,
             metadata.get("title"),
             metadata.get("image_url"),
         )
