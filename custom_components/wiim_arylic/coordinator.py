@@ -359,10 +359,13 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if val:
                     self.upnp_override[field] = val
 
-            # Push immediately to HA — don't wait for the HTTP coordinator tick
+            # Push immediately to HA — don't wait for the HTTP coordinator tick.
+            # We ALWAYS call async_update_listeners() here, even if an HTTP fetch is
+            # in progress.  The guard that was here before silently dropped fast-path
+            # updates whenever the 4-6s HTTP request was running — exactly the window
+            # where play/pause detection matters most.
             self.data = {"player": self.player}
-            if not self._refresh_in_progress:
-                self.async_update_listeners()
+            self.async_update_listeners()
 
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug(
@@ -374,10 +377,6 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Update coordinator data - polls device following pywiim's PollingStrategy."""
         try:
-            # Clear fast-path override: the library's fresh HTTP state will now
-            # be authoritative.  Entities will read player.* directly again.
-            self.upnp_override.clear()
-
             # Call player.refresh() to poll device and update cached state
             # PollingStrategy determines WHEN to poll (adaptive intervals)
             # Pre-seed entity_picture from previous UPnP poll so that
@@ -400,6 +399,13 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.player.refresh()
             finally:
                 self._refresh_in_progress = False
+
+            # Clear the fast-path override NOW — player.refresh() has completed so
+            # the library state is authoritative again.  We clear here (not at the
+            # top of this method) so any fast-loop update that fired *during* the
+            # HTTP fetch kept its override valid for the entity reads triggered by
+            # async_update_listeners() inside the fast loop.
+            self.upnp_override.clear()
 
             # --- UPnP GetInfoEx cover art poll (supplemental, best-effort) ---
             # The HTTP API does not expose albumArtURI. We poll the Linkplay
