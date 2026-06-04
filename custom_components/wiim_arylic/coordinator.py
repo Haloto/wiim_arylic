@@ -358,6 +358,14 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 val = upnp_data.get(field)
                 if val:
                     self.upnp_override[field] = val
+            # Volume, mute, loop_mode — always overwrite when present so volume
+            # slider and mute button respond without waiting for the HTTP tick.
+            if upnp_data.get("volume_level") is not None:
+                self.upnp_override["volume_level"] = upnp_data["volume_level"]
+            if upnp_data.get("is_muted") is not None:
+                self.upnp_override["is_muted"] = upnp_data["is_muted"]
+            if upnp_data.get("loop_mode") is not None:
+                self.upnp_override["loop_mode"] = upnp_data["loop_mode"]
 
             # Push immediately to HA — don't wait for the HTTP coordinator tick.
             # We ALWAYS call async_update_listeners() here, even if an HTTP fetch is
@@ -511,6 +519,14 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if image_url:
                 inject["image_url"] = image_url
 
+            # Volume/mute/loop_mode — always update from slow poll too
+            if upnp_data.get("volume_level") is not None:
+                inject["volume_level"] = upnp_data["volume_level"]
+            if upnp_data.get("is_muted") is not None:
+                inject["is_muted"] = upnp_data["is_muted"]
+            if upnp_data.get("loop_mode") is not None:
+                inject["loop_mode"] = upnp_data["loop_mode"]
+
             if not inject:
                 return
 
@@ -553,6 +569,12 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         setattr(status_model, "cover_url", inject["image_url"])
                     except (AttributeError, TypeError):
                         pass
+
+            # Persist volume/mute/loop_mode into upnp_override so entity
+            # properties read them between HTTP ticks.
+            for field in ("volume_level", "is_muted", "loop_mode"):
+                if inject.get(field) is not None:
+                    self.upnp_override[field] = inject[field]
 
         except Exception as err:  # noqa: BLE001
             # Never let cover art polling break the main update
