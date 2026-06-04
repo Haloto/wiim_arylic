@@ -175,6 +175,143 @@ class WiiMCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self.async_update_listeners()
 
+    def start_upnp_loop(self) -> None:
+        """Start the independent 1-second UPnP polling loop.
+
+        This loop runs completely separately from the HTTP coordinator cycle.
+        It polls GetInfoEx every second and immediately notifies HA listeners
+        when play_state changes — without waiting for the slow HTTP poll to finish.
+        Called from async_setup_entry after the coordinator is created.
+        """
+        if self._upnp_loop_unsub is not None:
+            return  # Already running
+
+        self._upnp_loop_unsub = async_track_time_interval(
+            self.hass,
+            self._async_upnp_loop_tick,
+            timedelta(seconds=1),
+        )
+        _LOGGER.debug("UPnP fast loop started for %s", self.player.host)
+
+    def stop_upnp_loop(self) -> None:
+        """Stop the independent UPnP polling loop."""
+        if self._upnp_loop_unsub is not None:
+            self._upnp_loop_unsub()
+            self._upnp_loop_unsub = None
+            _LOGGER.debug("UPnP fast loop stopped for %s", self.player.host)
+
+    @callback
+    def _async_upnp_loop_tick(self, _now: object) -> None:
+        """Called every second by async_track_time_interval.
+
+        Schedules the async UPnP poll as a fire-and-forget task so the
+        callback itself stays synchronous (required by HA event loop).
+        """
+        self.hass.async_create_task(self._async_fast_upnp_poll())
+
+    async def _async_fast_upnp_poll(self) -> None:
+        """Poll GetInfoEx and push state to HA immediately on change.
+
+        This is the fast path for play/pause/track-change detection.
+        Runs every second independently of the 4-6s HTTP coordinator cycle.
+        On play_state change it calls async_update_listeners() directly,
+        which is the same mechanism used by _on_player_state_changed().
+        """
+        try:
+            upnp_data = await self._upnp_poller.poll()
+            if not upnp_data:
+                return
+
+            new_play_state = upnp_data.get("play_state")
+            new_image_url = upnp_data.get("image_url")
+
+            # Detect meaningful state changes that warrant an immediate HA push
+            play_state_changed = (
+                new_play_state is not None
+                and new_play_state != self._last_upnp_play_state
+            )
+            image_url_changed = (
+                new_image_url
+                and new_image_url != self._last_upnp_image_url
+            )
+
+            if not play_state_changed and not image_url_changed:
+                # Nothing interesting changed — inject silently but don't push
+                # position/duration/metadata into state machine to avoid churn.
+                # The regular _poll_upnp_cover_art inside _async_update_data
+                # handles the full injection on each HTTP coordinator tick.
+                return
+
+            # Something changed — do full injection and notify HA immediately
+            _LOGGER.debug(
+                "UPnP fast loop: state change detected for %s "
+                "(play_state: %s→%s, art_changed: %s)",
+                self.player.host,
+                self._last_upnp_play_state,
+                new_play_state,
+                image_url_changed,
+            )
+
+            if play_state_changed:
+                self._last_upnp_play_state = new_play_state
+            if image_url_changed:
+                self._last_upnp_image_url = new_image_url
+
+            # Build and inject the full payload
+            inject: dict = {}
+            if new_play_state is not None:
+                inject["play_state"] = new_play_state
+            if upnp_data.get("position") is not None:
+                inject["position"] = upnp_data["position"]
+            if upnp_data.get("duration") is not None:
+                inject["duration"] = upnp_data["duration"]
+            for field in ("title", "artist", "album"):
+                val = upnp_data.get(field)
+                if val:
+                    inject[field] = val
+            if new_image_url:
+                inject["image_url"] = new_image_url
+
+            state_sync = getattr(self.player, "_state_synchronizer", None)
+            if state_sync is not None and hasattr(state_sync, "update_from_upnp"):
+                state_sync.update_from_upnp(inject, timestamp=time.time())
+
+            # Stamp status model for immediate visibility
+            status_model = getattr(self.player, "_status_model", None)
+            if status_model is not None:
+                _model_map = {
+                    "play_state": "play_state",
+                    "position": "position",
+                    "duration": "duration",
+                    "title": "title",
+                    "artist": "artist",
+                    "album": "album",
+                    "image_url": "entity_picture",
+                }
+                for inject_key, model_attr in _model_map.items():
+                    if inject_key in inject:
+                        try:
+                            setattr(status_model, model_attr, inject[inject_key])
+                        except (AttributeError, TypeError):
+                            pass
+                if "image_url" in inject:
+                    try:
+                        setattr(status_model, "cover_url", inject["image_url"])
+                    except (AttributeError, TypeError):
+                        pass
+
+            # Push immediately to HA — don't wait for the HTTP coordinator tick
+            self.data = {"player": self.player}
+            if not self._refresh_in_progress:
+                self.async_update_listeners()
+
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "UPnP fast loop error for %s (non-fatal): %s",
+                self.player.host,
+                err,
+            )
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Update coordinator data - polls device following pywiim's PollingStrategy."""
         try:
