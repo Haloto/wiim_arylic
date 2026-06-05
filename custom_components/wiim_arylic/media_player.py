@@ -252,14 +252,7 @@ class WiiMMediaPlayer(WiiMMediaPlayerMixin, WiimEntity, MediaPlayerEntity):
 
     @property
     def volume_level(self) -> float | None:
-        """Return volume level 0..1.
-
-        Prefers the UPnP fast-path override (updated every second) over the
-        HTTP-backed library value so the slider reflects changes immediately.
-        """
-        override = self.coordinator.upnp_override.get("volume_level")
-        if override is not None:
-            return override
+        """Return volume level 0..1 (already converted by Player)."""
         return self._get_player().volume_level
 
     @property
@@ -274,13 +267,7 @@ class WiiMMediaPlayer(WiiMMediaPlayerMixin, WiimEntity, MediaPlayerEntity):
 
     @property
     def is_volume_muted(self) -> bool | None:
-        """Return True if muted.
-
-        Prefers the UPnP fast-path override over the HTTP-backed library value.
-        """
-        override = self.coordinator.upnp_override.get("is_muted")
-        if override is not None:
-            return override
+        """Return True if muted."""
         return self._get_player().is_muted
 
     async def async_set_volume_level(self, volume: float) -> None:
